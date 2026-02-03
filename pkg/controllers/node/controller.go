@@ -18,15 +18,19 @@ package node
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutil "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -37,6 +41,11 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 }
 
+const (
+	orphanUnregisteredGracePeriod = 2 * time.Minute
+	instanceNamePrefix            = "karpenter-"
+)
+
 func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
@@ -45,6 +54,10 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 }
 
 func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcile.Result, error) {
+	if hasUnregisteredTaint(node) {
+		return c.reconcileUnregistered(ctx, node)
+	}
+
 	// if the node is not ready more then 30, skip
 	readyCond, ok := lo.Find(node.Status.Conditions, func(cond corev1.NodeCondition) bool {
 		return cond.Type == corev1.NodeReady
@@ -75,6 +88,43 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func (c *Controller) reconcileUnregistered(ctx context.Context, node *corev1.Node) (reconcile.Result, error) {
+	if time.Since(node.CreationTimestamp.Time) < orphanUnregisteredGracePeriod {
+		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !strings.HasPrefix(node.Name, instanceNamePrefix) {
+		return reconcile.Result{}, nil
+	}
+
+	nodeClaimName := strings.TrimPrefix(node.Name, instanceNamePrefix)
+	var nodeClaim karpv1.NodeClaim
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaimName}, &nodeClaim); err == nil {
+		return reconcile.Result{}, nil
+	} else if !apierrors.IsNotFound(err) {
+		return reconcile.Result{Requeue: true}, err
+	}
+
+	if node.Spec.ProviderID != "" {
+		if err := c.cloudProvider.Delete(ctx, node.Spec.ProviderID); err != nil {
+			log.FromContext(ctx).Error(err, "failed to delete orphan instance", "node", node.Name)
+		}
+	}
+
+	log.FromContext(ctx).Info("deleting orphan unregistered node", "node", node.Name)
+	if err := c.kubeClient.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+		return reconcile.Result{Requeue: true}, err
+	}
+
+	return reconcile.Result{}, nil
+}
+
+func hasUnregisteredTaint(node *corev1.Node) bool {
+	return lo.ContainsBy(node.Spec.Taints, func(t corev1.Taint) bool {
+		return t.Key == karpv1.UnregisteredTaintKey
+	})
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
