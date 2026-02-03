@@ -844,11 +844,16 @@ func isInstanceNotFoundError(err error) bool {
 
 func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 	var instances []*Instance
+	const instanceNamePrefix = "karpenter-"
+	clusterLabelKey := utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)
 	filter := fmt.Sprintf(
-		"(labels.%s:* AND labels.%s:* AND labels.%s:%s)",
+		"((labels.%s:* AND labels.%s:* AND labels.%s:%s) OR (name~'^%s' AND labels.%s:%s))",
 		utils.SanitizeGCELabelValue(utils.LabelNodePoolKey),
 		utils.SanitizeGCELabelValue(utils.LabelGCENodeClassKey),
-		utils.SanitizeGCELabelValue(utils.LabelClusterNameKey),
+		clusterLabelKey,
+		p.clusterName,
+		instanceNamePrefix,
+		clusterLabelKey,
 		p.clusterName,
 	)
 
