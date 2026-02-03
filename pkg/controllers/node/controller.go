@@ -108,7 +108,9 @@ func (c *Controller) reconcileUnregistered(ctx context.Context, node *corev1.Nod
 	}
 
 	if node.Spec.ProviderID != "" {
-		if err := c.cloudProvider.Delete(ctx, node.Spec.ProviderID); err != nil {
+		orphanClaim := &karpv1.NodeClaim{}
+		orphanClaim.Status.ProviderID = node.Spec.ProviderID
+		if err := c.cloudProvider.Delete(ctx, orphanClaim); err != nil {
 			log.FromContext(ctx).Error(err, "failed to delete orphan instance", "node", node.Name)
 		}
 	}
