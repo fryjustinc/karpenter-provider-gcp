@@ -19,6 +19,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
@@ -44,7 +45,11 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 )
 
-const CloudProviderName = "gcp"
+const (
+	CloudProviderName         = "gcp"
+	instanceNamePrefix        = "karpenter-"
+	orphanInstanceGracePeriod = 2 * time.Minute
+)
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
 
@@ -120,7 +125,26 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 	}
 
 	var nodeClaims []*karpv1.NodeClaim
+	now := time.Now()
 	for _, instance := range instances {
+		nodeClaimName := strings.TrimPrefix(instance.Name, instanceNamePrefix)
+		if nodeClaimName != instance.Name {
+			var nodeClaim karpv1.NodeClaim
+			if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaimName}, &nodeClaim); err != nil {
+				if errors.IsNotFound(err) {
+					if now.Sub(instance.CreationTime) >= orphanInstanceGracePeriod {
+						providerID := fmt.Sprintf("gce://%s/%s/%s", instance.ProjectID, instance.Location, instance.Name)
+						if delErr := c.instanceProvider.Delete(ctx, providerID); delErr != nil {
+							log.FromContext(ctx).Error(delErr, "failed to delete orphan instance", "instance", instance.Name)
+						} else {
+							log.FromContext(ctx).Info("deleted orphan instance", "instance", instance.Name)
+						}
+					}
+					continue
+				}
+				return nil, fmt.Errorf("checking nodeclaim %s, %w", nodeClaimName, err)
+			}
+		}
 		instanceType, err := c.resolveInstanceTypeFromInstance(ctx, instance)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed to resolve instance type")
