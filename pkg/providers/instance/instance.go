@@ -847,11 +847,7 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 	const instanceNamePrefix = "karpenter-"
 	clusterLabelKey := utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)
 	filter := fmt.Sprintf(
-		"((labels.%s:* AND labels.%s:* AND labels.%s:%s) OR (name~'^%s' AND labels.%s:%s))",
-		utils.SanitizeGCELabelValue(utils.LabelNodePoolKey),
-		utils.SanitizeGCELabelValue(utils.LabelGCENodeClassKey),
-		clusterLabelKey,
-		p.clusterName,
+		"(name~'^%s' AND labels.%s=%s)",
 		instanceNamePrefix,
 		clusterLabelKey,
 		p.clusterName,
