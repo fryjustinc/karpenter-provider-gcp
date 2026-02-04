@@ -263,10 +263,8 @@ func (p *DefaultProvider) UpdateInstanceTypes(ctx context.Context) error {
 }
 
 func (p *DefaultProvider) getInstanceTypes(ctx context.Context) ([]*computepb.MachineType, error) {
-	vmFilter := fmt.Sprintf("(zone eq .*%s-.*)", p.authOptions.Region)
 	req := &computepb.AggregatedListMachineTypesRequest{
 		Project: p.authOptions.ProjectID,
-		Filter:  &vmFilter,
 	}
 
 	it := p.machineTypesClient.AggregatedList(ctx, req)
