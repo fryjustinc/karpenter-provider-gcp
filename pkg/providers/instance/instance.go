@@ -579,8 +579,13 @@ func (p *DefaultProvider) setupInstanceMetadata(instanceMetadata *compute.Metada
 		}
 	}
 
+	nodeLabels := metadata.GetNodeLabels(nodeClass, nodeClaim)
+	nodeLabels[karpv1.NodeRegisteredLabelKey] = "true"
 	metadata.AppendNodeClaimLabel(nodeClaim, nodeClass, instanceMetadata)
 	metadata.AppendRegisteredLabel(instanceMetadata)
+	if err := metadata.AppendNodeLabelsToKubeEnv(instanceMetadata, nodeLabels); err != nil {
+		return fmt.Errorf("failed to append node labels to kube-env: %w", err)
+	}
 	metadata.AppendSecondaryBootDisks(p.projectID, nodeClass, instanceMetadata)
 	metadata.ApplyCustomMetadata(instanceMetadata, nodeClass.Spec.Metadata)
 

@@ -36,6 +36,7 @@ var (
 	maxPodsPerNodeRegex  = regexp.MustCompile(`max-pods-per-node=\d+`)
 	maxPodsRegex         = regexp.MustCompile(`max-pods=\d+`)
 	gkeProvisioningRegex = regexp.MustCompile(`gke-provisioning=\w+`)
+	nodeLabelsRegex      = regexp.MustCompile(`--node-labels=([^\s]+)`)
 )
 
 func GetClusterName(metadata *compute.Metadata) (string, error) {
@@ -194,7 +195,7 @@ func AppendNodeClaimLabel(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENo
 	// Remove nodePoolLabelEntry from `kube-labels` and `kube-env`
 	for _, item := range metadata.Items {
 		if item.Key == "kube-labels" {
-			labels := getNodeLabels(nodeClass, nodeClaim)
+			labels := GetNodeLabels(nodeClass, nodeClaim)
 			labelString := make([]string, 0, len(labels))
 			for k, v := range labels {
 				// Append the nodeclaim label to kube-labels
@@ -214,7 +215,63 @@ func AppendRegisteredLabel(metadata *compute.Metadata) {
 	}
 }
 
-func getNodeLabels(nodeClass *v1alpha1.GCENodeClass, nodeClaim *karpv1.NodeClaim) map[string]string {
+func AppendNodeLabelsToKubeEnv(metadata *compute.Metadata, labels map[string]string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+
+	labelPairs := make([]string, 0, len(labels))
+	labelSet := make(map[string]struct{}, len(labels))
+	for k, v := range labels {
+		pair := fmt.Sprintf("%s=%s", k, v)
+		labelPairs = append(labelPairs, pair)
+		labelSet[pair] = struct{}{}
+	}
+
+	updated := false
+	for _, item := range metadata.Items {
+		if item.Key != "kube-env" {
+			continue
+		}
+
+		kubeEnv := swag.StringValue(item.Value)
+		lines := strings.Split(kubeEnv, "\n")
+		for i, line := range lines {
+			if !strings.HasPrefix(line, "KUBELET_ARGS:") {
+				continue
+			}
+
+			if match := nodeLabelsRegex.FindStringSubmatch(line); len(match) == 2 {
+				existing := strings.Split(match[1], ",")
+				for _, entry := range existing {
+					labelSet[entry] = struct{}{}
+				}
+				combined := make([]string, 0, len(labelSet))
+				for entry := range labelSet {
+					combined = append(combined, entry)
+				}
+				newArg := "--node-labels=" + strings.Join(combined, ",")
+				lines[i] = nodeLabelsRegex.ReplaceAllString(line, newArg)
+			} else {
+				lines[i] = line + " --node-labels=" + strings.Join(labelPairs, ",")
+			}
+			updated = true
+			break
+		}
+
+		if updated {
+			item.Value = swag.String(strings.Join(lines, "\n"))
+		}
+	}
+
+	if !updated {
+		return fmt.Errorf("failed to patch node labels into kube-env")
+	}
+
+	return nil
+}
+
+func GetNodeLabels(nodeClass *v1alpha1.GCENodeClass, nodeClaim *karpv1.NodeClaim) map[string]string {
 	staticTags := map[string]string{
 		karpv1.NodePoolLabelKey: nodeClaim.Labels[karpv1.NodePoolLabelKey],
 		v1alpha1.LabelNodeClass: nodeClass.Name,
