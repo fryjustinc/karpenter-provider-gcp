@@ -109,15 +109,6 @@ func RenderKubeletConfigMetadata(metaData *compute.Metadata, instanceType *cloud
 }
 
 func RemoveGKEBuiltinLabels(metadata *compute.Metadata, nodePoolName string) error {
-	nodePoolLabelEntry := fmt.Sprintf("%s=%s", GKENodePoolLabel, nodePoolName)
-	// Remove nodePoolLabelEntry from `kube-labels` and `kube-env`
-	for _, item := range metadata.Items {
-		if item.Key != "kube-labels" && item.Key != "kube-env" {
-			continue
-		}
-
-		item.Value = swag.String(strings.ReplaceAll(swag.StringValue(item.Value), nodePoolLabelEntry, ""))
-	}
 	return nil
 }
 
@@ -156,6 +147,148 @@ func SetProvisioningModel(metadata *compute.Metadata, model string) error {
 		targetEntry.Value = swag.String(gkeProvisioningRegex.ReplaceAllString(*targetEntry.Value, gkeProvisioning))
 
 		metadata.Items[index] = targetEntry
+	}
+	return nil
+}
+
+func DisableBestEffortNodeReboot(metadata *compute.Metadata) error {
+	updated := false
+	// Update kube-env only
+	for _, item := range metadata.Items {
+		if item.Key != "kube-env" {
+			continue
+		}
+		kubeEnv := swag.StringValue(item.Value)
+		lines := strings.Split(kubeEnv, "\n")
+		found := false
+		for i, line := range lines {
+			if strings.HasPrefix(line, "ENABLE_BEST_EFFORT_NODE_REBOOT:") {
+				lines[i] = "ENABLE_BEST_EFFORT_NODE_REBOOT: \"false\""
+				found = true
+			}
+		}
+		if !found {
+			lines = append(lines, "ENABLE_BEST_EFFORT_NODE_REBOOT: \"false\"")
+		}
+		item.Value = swag.String(strings.Join(lines, "\n"))
+		updated = true
+	}
+	if !updated {
+		return fmt.Errorf("failed to patch ENABLE_BEST_EFFORT_NODE_REBOOT")
+	}
+	return nil
+}
+
+func DisableNodeRegistrationChecker(metadata *compute.Metadata) error {
+	updated := false
+	for _, item := range metadata.Items {
+		if item.Key != "kube-env" {
+			continue
+		}
+		kubeEnv := swag.StringValue(item.Value)
+		lines := strings.Split(kubeEnv, "\n")
+		found := false
+		for i, line := range lines {
+			if strings.HasPrefix(line, "ENABLE_NODE_REGISTRATION_CHECKER:") {
+				lines[i] = "ENABLE_NODE_REGISTRATION_CHECKER: \"false\""
+				found = true
+			}
+		}
+		if !found {
+			lines = append(lines, "ENABLE_NODE_REGISTRATION_CHECKER: \"false\"")
+		}
+		item.Value = swag.String(strings.Join(lines, "\n"))
+		updated = true
+	}
+	if !updated {
+		return fmt.Errorf("failed to patch ENABLE_NODE_REGISTRATION_CHECKER")
+	}
+	return nil
+}
+
+func DisableNodeRegistrationCheckerService(metadata *compute.Metadata) {
+	const startupKey = "startup-script"
+	const disableScript = `#!/bin/bash
+systemctl stop gke-node-reg-checker.service || true
+systemctl disable gke-node-reg-checker.service || true
+systemctl mask gke-node-reg-checker.service || true
+`
+
+	for _, item := range metadata.Items {
+		if item.Key != startupKey {
+			continue
+		}
+		current := swag.StringValue(item.Value)
+		if strings.Contains(current, "gke-node-reg-checker.service") {
+			return
+		}
+		if current != "" && !strings.HasSuffix(current, "\n") {
+			current += "\n"
+		}
+		item.Value = swag.String(current + disableScript)
+		return
+	}
+
+	metadata.Items = append(metadata.Items, &compute.MetadataItems{
+		Key:   startupKey,
+		Value: swag.String(disableScript),
+	})
+}
+
+func DisableNodeRegistrationCheckerInUserData(metadata *compute.Metadata) error {
+	for _, item := range metadata.Items {
+		if item.Key != "user-data" {
+			continue
+		}
+		userData := swag.StringValue(item.Value)
+		if !strings.HasPrefix(userData, "#cloud-config") {
+			return nil
+		}
+		trimmed := strings.TrimPrefix(userData, "#cloud-config\n")
+		var config map[string]interface{}
+		if err := yaml.Unmarshal([]byte(trimmed), &config); err != nil {
+			return fmt.Errorf("failed to parse user-data: %w", err)
+		}
+
+		bootcmd, _ := config["bootcmd"].([]interface{})
+		hasCommand := func(args []interface{}) bool {
+			for _, cmd := range bootcmd {
+				list, ok := cmd.([]interface{})
+				if !ok || len(list) != len(args) {
+					continue
+				}
+				match := true
+				for i := range list {
+					if fmt.Sprint(list[i]) != fmt.Sprint(args[i]) {
+						match = false
+						break
+					}
+				}
+				if match {
+					return true
+				}
+			}
+			return false
+		}
+
+		commands := [][]interface{}{
+			{"systemctl", "stop", "gke-node-reg-checker.service"},
+			{"systemctl", "disable", "gke-node-reg-checker.service"},
+			{"systemctl", "mask", "gke-node-reg-checker.service"},
+		}
+		for _, cmd := range commands {
+			if !hasCommand(cmd) {
+				bootcmd = append(bootcmd, cmd)
+			}
+		}
+		config["bootcmd"] = bootcmd
+
+		updated, err := yaml.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("failed to marshal user-data: %w", err)
+		}
+		item.Value = swag.String("#cloud-config\n" + string(updated))
+		return nil
 	}
 	return nil
 }

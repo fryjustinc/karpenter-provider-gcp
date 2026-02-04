@@ -65,11 +65,14 @@ func (p *DefaultProvider) ResolveClusterZones(ctx context.Context) ([]string, er
 	projectID := options.FromContext(ctx).ProjectID
 	clusterLocation := options.FromContext(ctx).ClusterLocation
 
-	region := clusterLocation
 	if strings.Count(clusterLocation, "-") == 2 {
-		parts := strings.Split(clusterLocation, "-")
-		region = strings.Join(parts[:2], "-")
+		log.FromContext(ctx).Info("zonal cluster detected, restricting zones", "clusterLocation", clusterLocation)
+		zones := []string{clusterLocation}
+		p.zoneCache.Set(zoneCacheKey, zones, cache.DefaultExpiration)
+		return zones, nil
 	}
+
+	region := clusterLocation
 
 	var zones []string
 	prefix := region + "-"

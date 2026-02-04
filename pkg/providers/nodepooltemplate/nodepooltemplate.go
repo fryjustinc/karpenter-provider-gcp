@@ -69,10 +69,17 @@ func NewDefaultProvider(ctx context.Context, kubeClient client.Client, computeSe
 	containerService *container.Service, versionProvider version.Provider,
 	clusterName, region, projectID, serviceAccount, clusterLocation, nodeLocation string) *DefaultProvider {
 
-	zones, err := resolveZones(ctx, computeService, projectID, region)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to create default provider for node pool template")
-		os.Exit(1)
+	var zones []string
+	if strings.Count(nodeLocation, "-") == 2 {
+		log.FromContext(ctx).Info("zonal node location detected for node pool template", "nodeLocation", nodeLocation)
+		zones = []string{nodeLocation}
+	} else {
+		var err error
+		zones, err = resolveZones(ctx, computeService, projectID, region)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to create default provider for node pool template")
+			os.Exit(1)
+		}
 	}
 
 	return &DefaultProvider{
@@ -155,8 +162,20 @@ func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, i
 	nodePoolSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s/nodePools/%s",
 		p.ClusterInfo.ProjectID, p.ClusterInfo.NodeLocation, p.ClusterInfo.Name, nodePoolName)
 
-	_, err := p.containerService.Projects.Locations.Clusters.NodePools.Get(nodePoolSelfLink).Context(ctx).Do()
+	existingNodePool, err := p.containerService.Projects.Locations.Clusters.NodePools.Get(nodePoolSelfLink).Context(ctx).Do()
 	if err == nil {
+		needsGcfsDisable := existingNodePool.Config == nil || existingNodePool.Config.GcfsConfig == nil || existingNodePool.Config.GcfsConfig.Enabled
+		if needsGcfsDisable {
+			logger.Info("disabling GCFS on existing node pool", "name", nodePoolName)
+			updateReq := &container.UpdateNodePoolRequest{
+				Name:       nodePoolSelfLink,
+				GcfsConfig: &container.GcfsConfig{Enabled: false},
+			}
+			if _, updateErr := p.containerService.Projects.Locations.Clusters.NodePools.Update(nodePoolSelfLink, updateReq).Context(ctx).Do(); updateErr != nil {
+				logger.Error(updateErr, "failed to disable GCFS on node pool", "name", nodePoolName)
+				return updateErr
+			}
+		}
 		logger.Info("template node pool already exists", "name", nodePoolName)
 		return nil
 	}
@@ -177,6 +196,7 @@ func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, i
 			Config: &container.NodeConfig{
 				ImageType:      imageType,
 				ServiceAccount: serviceAccount,
+				GcfsConfig:     &container.GcfsConfig{Enabled: false},
 			},
 		},
 	}

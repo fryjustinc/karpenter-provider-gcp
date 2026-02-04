@@ -43,6 +43,7 @@ type Controller struct {
 
 const (
 	orphanUnregisteredGracePeriod = 2 * time.Minute
+	readyDeletionGracePeriod      = 10 * time.Minute
 	instanceNamePrefix            = "karpenter-"
 )
 
@@ -58,14 +59,15 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 		return c.reconcileUnregistered(ctx, node)
 	}
 
-	// if the node is not ready more then 30, skip
+	// Only consider emptiness for nodes that are Ready.
 	readyCond, ok := lo.Find(node.Status.Conditions, func(cond corev1.NodeCondition) bool {
 		return cond.Type == corev1.NodeReady
 	})
 	if !ok || readyCond.Status != corev1.ConditionTrue {
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{}, nil
 	}
 
+	// Require the node to be Ready for a while before checking emptiness.
 	if time.Since(readyCond.LastTransitionTime.Time) < 3*time.Minute {
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
@@ -78,6 +80,11 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	// check if the node is empty
 	if !c.isEmpty(node) {
 		return reconcile.Result{}, nil
+	}
+
+	// ensure the node has been Ready for a minimum duration before deleting
+	if readyFor := time.Since(readyCond.LastTransitionTime.Time); readyFor < readyDeletionGracePeriod {
+		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// TODO: it should follow the emptiness disrupt rule of the target nodepool

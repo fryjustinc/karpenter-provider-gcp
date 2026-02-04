@@ -46,6 +46,9 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 }
 
 func (c *CloudProvider) isImageDrifted(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass) cloudprovider.DriftReason {
+	if nodeClaim.Status.ImageID == "" {
+		return ""
+	}
 	for _, im := range nodeClass.Status.Images {
 		if strings.HasSuffix(nodeClaim.Status.ImageID, im.SourceImage) {
 			return ""

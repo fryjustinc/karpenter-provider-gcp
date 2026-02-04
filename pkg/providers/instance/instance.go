@@ -300,6 +300,17 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 	cheapestZone := ""
 	cheapestPrice := math.MaxFloat64
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+	zoneRequirement := reqs.Get(corev1.LabelTopologyZone)
+	filteredZones := lo.Filter(zones, func(zone string, _ int) bool {
+		return zoneRequirement.Has(zone)
+	})
+	if len(filteredZones) == 0 {
+		return "", fmt.Errorf("no zones satisfy nodeclaim %q requirement %s (available: %s)", nodeClaim.Name, zoneRequirement.String(), strings.Join(zones, ","))
+	}
+	if len(filteredZones) != len(zones) {
+		log.FromContext(ctx).Info("filtered zones by nodeclaim requirements", "nodeclaim", nodeClaim.Name, "zones", filteredZones, "requirement", zoneRequirement.String())
+	}
+	zones = filteredZones
 	if capacityType == karpv1.CapacityTypeOnDemand {
 		// For on-demand, randomly select a zone
 		if len(zones) > 0 {
@@ -439,7 +450,8 @@ func (p *DefaultProvider) buildInstance(nodeClaim *karpv1.NodeClaim, nodeClass *
 	capacityType := p.getCapacityType(nodeClaim, []*cloudprovider.InstanceType{instanceType})
 
 	// Setup metadata
-	if err := p.setupInstanceMetadata(template.Properties.Metadata, nodeClass, instanceType, nodeClaim, nodePoolName, capacityType); err != nil {
+	metadataCopy := cloneMetadata(template.Properties.Metadata)
+	if err := p.setupInstanceMetadata(metadataCopy, nodeClass, instanceType, nodeClaim, nodePoolName, capacityType); err != nil {
 		log.FromContext(context.Background()).Error(err, "failed to setup instance metadata")
 		return nil
 	}
@@ -459,7 +471,7 @@ func (p *DefaultProvider) buildInstance(nodeClaim *karpv1.NodeClaim, nodeClass *
 		Disks:             attachedDisks,
 		NetworkInterfaces: networkInterfaces,
 		ServiceAccounts:   serviceAccounts,
-		Metadata:          template.Properties.Metadata,
+		Metadata:          metadataCopy,
 		Labels:            p.initializeInstanceLabels(nodeClass),
 		Scheduling:        sched,
 		Tags:              mergeInstanceTags(template.Properties.Tags, nodeClass.Spec.NetworkTags),
@@ -556,6 +568,19 @@ func (p *DefaultProvider) setupInstanceMetadata(instanceMetadata *compute.Metada
 		return fmt.Errorf("failed to render kubelet config metadata: %w", err)
 	}
 
+	if err := metadata.DisableBestEffortNodeReboot(instanceMetadata); err != nil {
+		return fmt.Errorf("failed to disable best effort node reboot: %w", err)
+	}
+
+	if err := metadata.DisableNodeRegistrationChecker(instanceMetadata); err != nil {
+		return fmt.Errorf("failed to disable node registration checker: %w", err)
+	}
+
+	metadata.DisableNodeRegistrationCheckerService(instanceMetadata)
+	if err := metadata.DisableNodeRegistrationCheckerInUserData(instanceMetadata); err != nil {
+		return fmt.Errorf("failed to disable node registration checker in user-data: %w", err)
+	}
+
 	if err := metadata.PatchUnregisteredTaints(instanceMetadata); err != nil {
 		return fmt.Errorf("failed to append unregistered taint to kube-env: %w", err)
 	}
@@ -572,6 +597,37 @@ func (p *DefaultProvider) setupInstanceMetadata(instanceMetadata *compute.Metada
 	metadata.ApplyCustomMetadata(instanceMetadata, nodeClass.Spec.Metadata)
 
 	return nil
+}
+
+func cloneMetadata(meta *compute.Metadata) *compute.Metadata {
+	if meta == nil {
+		return &compute.Metadata{}
+	}
+	clone := &compute.Metadata{
+		Fingerprint:     meta.Fingerprint,
+		ForceSendFields: append([]string(nil), meta.ForceSendFields...),
+		NullFields:      append([]string(nil), meta.NullFields...),
+	}
+	if len(meta.Items) == 0 {
+		return clone
+	}
+	clone.Items = make([]*compute.MetadataItems, 0, len(meta.Items))
+	for _, item := range meta.Items {
+		if item == nil {
+			continue
+		}
+		copied := &compute.MetadataItems{
+			Key:          item.Key,
+			ForceSendFields: append([]string(nil), item.ForceSendFields...),
+			NullFields:      append([]string(nil), item.NullFields...),
+		}
+		if item.Value != nil {
+			val := *item.Value
+			copied.Value = &val
+		}
+		clone.Items = append(clone.Items, copied)
+	}
+	return clone
 }
 
 // setupServiceAccounts configures service accounts for the instance
@@ -845,13 +901,6 @@ func isInstanceNotFoundError(err error) bool {
 func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 	var instances []*Instance
 	const instanceNamePrefix = "karpenter-"
-	clusterLabelKey := utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)
-	filter := fmt.Sprintf(
-		"(name~'^%s' AND labels.%s=%s)",
-		instanceNamePrefix,
-		clusterLabelKey,
-		p.clusterName,
-	)
 
 	zones, err := p.getZonesInRegion(ctx)
 	if err != nil {
@@ -859,7 +908,7 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 	}
 
 	for _, zone := range zones {
-		req := p.computeService.Instances.List(p.projectID, zone).Filter(filter).Context(ctx)
+		req := p.computeService.Instances.List(p.projectID, zone).Context(ctx)
 
 		err := req.Pages(ctx, func(page *compute.InstanceList) error {
 			if len(page.Items) == 0 {
@@ -867,6 +916,15 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 			}
 
 			for _, inst := range page.Items {
+				if !strings.HasPrefix(inst.Name, instanceNamePrefix) {
+					continue
+				}
+				if inst.Labels == nil {
+					continue
+				}
+				if inst.Labels[utils.LabelClusterNameKey] != p.clusterName {
+					continue
+				}
 				instance := &Instance{
 					InstanceID:   inst.Name,
 					Name:         inst.Name,
