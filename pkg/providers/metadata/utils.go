@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/go-openapi/swag"
@@ -36,6 +37,7 @@ var (
 	maxPodsPerNodeRegex  = regexp.MustCompile(`max-pods-per-node=\d+`)
 	maxPodsRegex         = regexp.MustCompile(`max-pods=\d+`)
 	gkeProvisioningRegex = regexp.MustCompile(`gke-provisioning=\w+`)
+	nodeLabelsRegex      = regexp.MustCompile(`--node-labels=([^ ]+)`)
 )
 
 func GetClusterName(metadata *compute.Metadata) (string, error) {
@@ -327,7 +329,7 @@ func AppendNodeClaimLabel(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENo
 	// Remove nodePoolLabelEntry from `kube-labels` and `kube-env`
 	for _, item := range metadata.Items {
 		if item.Key == "kube-labels" {
-			labels := getNodeLabels(nodeClass, nodeClaim)
+			labels := GetNodeLabels(nodeClass, nodeClaim)
 			labelString := make([]string, 0, len(labels))
 			for k, v := range labels {
 				// Append the nodeclaim label to kube-labels
@@ -347,12 +349,81 @@ func AppendRegisteredLabel(metadata *compute.Metadata) {
 	}
 }
 
+func GetNodeLabels(nodeClass *v1alpha1.GCENodeClass, nodeClaim *karpv1.NodeClaim) map[string]string {
+	return getNodeLabels(nodeClass, nodeClaim)
+}
+
+func AppendNodeLabelsToKubeEnv(metadata *compute.Metadata, labels map[string]string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+
+	labelPairs := make([]string, 0, len(labels))
+	for k, v := range labels {
+		labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+	}
+	sort.Strings(labelPairs)
+	newLabelsArg := fmt.Sprintf("--node-labels=%s", strings.Join(labelPairs, ","))
+
+	updated := false
+	for _, item := range metadata.Items {
+		if item.Key != "kube-env" {
+			continue
+		}
+		kubeEnv := swag.StringValue(item.Value)
+		lines := strings.Split(kubeEnv, "\n")
+		for i, line := range lines {
+			if !strings.HasPrefix(line, "KUBELET_ARGS:") {
+				continue
+			}
+			if match := nodeLabelsRegex.FindStringSubmatch(line); len(match) > 1 {
+				merged := mergeNodeLabels(match[1], labels)
+				line = nodeLabelsRegex.ReplaceAllString(line, "--node-labels="+merged)
+			} else {
+				line = line + " " + newLabelsArg
+			}
+			lines[i] = line
+			updated = true
+		}
+		item.Value = swag.String(strings.Join(lines, "\n"))
+	}
+
+	if !updated {
+		return fmt.Errorf("failed to append node labels to kube-env")
+	}
+
+	return nil
+}
+
 func getNodeLabels(nodeClass *v1alpha1.GCENodeClass, nodeClaim *karpv1.NodeClaim) map[string]string {
 	staticTags := map[string]string{
 		karpv1.NodePoolLabelKey: nodeClaim.Labels[karpv1.NodePoolLabelKey],
 		v1alpha1.LabelNodeClass: nodeClass.Name,
 	}
 	return staticTags
+}
+
+func mergeNodeLabels(existing string, labels map[string]string) string {
+	merged := map[string]string{}
+	for _, pair := range strings.Split(existing, ",") {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) == 2 {
+			merged[parts[0]] = parts[1]
+		}
+	}
+	for k, v := range labels {
+		merged[k] = v
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, fmt.Sprintf("%s=%s", k, merged[k]))
+	}
+	return strings.Join(out, ",")
 }
 
 func AppendSecondaryBootDisks(projectID string, nodeClass *v1alpha1.GCENodeClass, metadata *compute.Metadata) {
