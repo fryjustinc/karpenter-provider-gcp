@@ -82,12 +82,28 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 		return reconcile.Result{}, nil
 	}
 
+	nodePoolName := node.Labels[karpv1.NodePoolLabelKey]
+	if nodePoolName == "" {
+		return reconcile.Result{}, nil
+	}
+
+	nodePool := &karpv1.NodePool{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+		if apierrors.IsNotFound(err) {
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{Requeue: true}, err
+	}
+
+	if nodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
+		return reconcile.Result{}, nil
+	}
+
 	// ensure the node has been Ready for a minimum duration before deleting
 	if readyFor := time.Since(readyCond.LastTransitionTime.Time); readyFor < readyDeletionGracePeriod {
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// TODO: it should follow the emptiness disrupt rule of the target nodepool
 	log.FromContext(ctx).Info("deleting empty node", "node", node.Name)
 	// delete the node
 	if err := c.kubeClient.Delete(ctx, node); err != nil {
