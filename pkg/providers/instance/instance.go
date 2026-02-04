@@ -297,18 +297,18 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 		return "", err
 	}
 
+	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+	// Constrain selection to the chosen capacity type.
+	reqs[karpv1.CapacityTypeLabelKey] = scheduling.NewRequirement(
+		karpv1.CapacityTypeLabelKey,
+		corev1.NodeSelectorOpIn,
+		capacityType,
+	)
+
 	cheapestZone := ""
 	cheapestPrice := math.MaxFloat64
-	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
-	if capacityType == karpv1.CapacityTypeOnDemand {
-		// For on-demand, randomly select a zone
-		if len(zones) > 0 {
-			randomIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(zones))))
-			return zones[randomIndex.Int64()], nil
-		}
-	}
-
 	zonesSet := sets.NewString(zones...)
+	compatibleZones := sets.NewString()
 	// For different AZ, the spot price may differ. So we need to get the cheapest vSwitch in the zone
 	for _, offering := range instanceType.Offerings {
 		if !offering.Available {
@@ -321,12 +321,25 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 		if !ok {
 			continue
 		}
+		compatibleZones.Insert(offering.Requirements.Get(corev1.LabelTopologyZone).Any())
 		if offering.Price < cheapestPrice {
 			cheapestZone = offering.Requirements.Get(corev1.LabelTopologyZone).Any()
 			cheapestPrice = offering.Price
 		}
 	}
 
+	if capacityType == karpv1.CapacityTypeOnDemand {
+		if compatibleZones.Len() == 0 {
+			return "", fmt.Errorf("no compatible zones found for %s", instanceType.Name)
+		}
+		zoneList := compatibleZones.List()
+		randomIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(zoneList))))
+		return zoneList[randomIndex.Int64()], nil
+	}
+
+	if cheapestZone == "" {
+		return "", fmt.Errorf("no compatible zones found for %s", instanceType.Name)
+	}
 	return cheapestZone, nil
 }
 

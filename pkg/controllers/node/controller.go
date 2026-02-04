@@ -142,7 +142,8 @@ var ignorePodsByLabel = map[string]string{
 
 func (c *Controller) isEmpty(node *corev1.Node) bool {
 	var pods corev1.PodList
-	if err := c.kubeClient.List(context.Background(), &pods, client.InNamespace(node.Namespace), client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+	// Nodes are cluster-scoped, so we must list pods across all namespaces.
+	if err := c.kubeClient.List(context.Background(), &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
 		return false
 	}
 
