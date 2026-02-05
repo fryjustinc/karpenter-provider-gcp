@@ -465,6 +465,18 @@ func (p *DefaultProvider) buildInstance(nodeClaim *karpv1.NodeClaim, nodeClass *
 
 	sched := p.setupScheduling(template, capacityType)
 
+	// Merge template labels with nodeclass labels so GKE-required labels (like goog-k8s-node-pool-name)
+	// are preserved while still honoring nodeclass overrides.
+	mergedLabels := map[string]string{}
+	if template.Properties.Labels != nil {
+		for k, v := range template.Properties.Labels {
+			mergedLabels[k] = v
+		}
+	}
+	for k, v := range p.initializeInstanceLabels(nodeClass) {
+		mergedLabels[k] = v
+	}
+
 	// Create instance
 	instance := &compute.Instance{
 		Name:              instanceName,
@@ -473,7 +485,7 @@ func (p *DefaultProvider) buildInstance(nodeClaim *karpv1.NodeClaim, nodeClass *
 		NetworkInterfaces: networkInterfaces,
 		ServiceAccounts:   serviceAccounts,
 		Metadata:          template.Properties.Metadata,
-		Labels:            p.initializeInstanceLabels(nodeClass),
+		Labels:            mergedLabels,
 		Scheduling:        sched,
 		Tags:              mergeInstanceTags(template.Properties.Tags, nodeClass.Spec.NetworkTags),
 		GuestAccelerators: template.Properties.GuestAccelerators,
@@ -579,13 +591,9 @@ func (p *DefaultProvider) setupInstanceMetadata(instanceMetadata *compute.Metada
 		}
 	}
 
-	nodeLabels := metadata.GetNodeLabels(nodeClass, nodeClaim)
-	nodeLabels[karpv1.NodeRegisteredLabelKey] = "true"
 	metadata.AppendNodeClaimLabel(nodeClaim, nodeClass, instanceMetadata)
 	metadata.AppendRegisteredLabel(instanceMetadata)
-	if err := metadata.AppendNodeLabelsToKubeEnv(instanceMetadata, nodeLabels); err != nil {
-		return fmt.Errorf("failed to append node labels to kube-env: %w", err)
-	}
+
 	metadata.AppendSecondaryBootDisks(p.projectID, nodeClass, instanceMetadata)
 	metadata.ApplyCustomMetadata(instanceMetadata, nodeClass.Spec.Metadata)
 
@@ -700,7 +708,7 @@ func mergeInstanceTags(templateTags *compute.Tags, networkTags []v1alpha1.Networ
 }
 
 func (p *DefaultProvider) Get(ctx context.Context, providerID string) (*Instance, error) {
-	_, _, instanceName, err := parseGCEProviderID(providerID)
+	project, zone, instanceName, err := parseGCEProviderID(providerID)
 	if err != nil {
 		return nil, fmt.Errorf("parsing provider ID: %w", err)
 	}
@@ -709,17 +717,30 @@ func (p *DefaultProvider) Get(ctx context.Context, providerID string) (*Instance
 		return instance.(*Instance), nil
 	}
 
-	if err := p.syncInstances(ctx); err != nil {
-		log.FromContext(ctx).Error(err, "syncing instances")
-		return nil, err
+	inst, err := p.computeService.Instances.Get(project, zone, instanceName).Context(ctx).Do()
+	if err != nil {
+		if isInstanceNotFoundError(err) {
+			return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("instance(%s) not found ", providerID))
+		}
+		return nil, fmt.Errorf("getting instance: %w", err)
 	}
 
-	currentInstance, ok := p.instanceCache.Get(instanceName)
-	if ok {
-		return currentInstance.(*Instance), nil
+	instance := &Instance{
+		InstanceID:   inst.Name,
+		Name:         inst.Name,
+		Type:         inst.MachineType[strings.LastIndex(inst.MachineType, "/")+1:],
+		Location:     zone,
+		ProjectID:    project,
+		ImageID:      getBootImageID(inst),
+		CreationTime: parseCreationTime(inst.CreationTimestamp),
+		CapacityType: resolveCapacityType(inst.Scheduling),
+		Labels:       inst.Labels,
+		Tags:         inst.Labels,
+		Status:       inst.Status,
 	}
 
-	return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("instance(%s) not found ", providerID))
+	p.instanceCache.Set(instance.InstanceID, instance, cache.DefaultExpiration)
+	return instance, nil
 }
 
 func parseCreationTime(ts string) time.Time {
@@ -864,7 +885,6 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 	var instances []*Instance
 	const instanceNamePrefix = "karpenter-"
 	clusterLabelKey := utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)
-	filter := fmt.Sprintf("labels.%s = %q", clusterLabelKey, p.clusterName)
 
 	zones, err := p.getZonesInRegion(ctx)
 	if err != nil {
@@ -872,7 +892,7 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 	}
 
 	for _, zone := range zones {
-		req := p.computeService.Instances.List(p.projectID, zone).Filter(filter).Context(ctx)
+		req := p.computeService.Instances.List(p.projectID, zone).Context(ctx)
 
 		err := req.Pages(ctx, func(page *compute.InstanceList) error {
 			if len(page.Items) == 0 {
@@ -882,6 +902,11 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 			for _, inst := range page.Items {
 				if !strings.HasPrefix(inst.Name, instanceNamePrefix) {
 					continue
+				}
+				if inst.Labels != nil {
+					if v, ok := inst.Labels[clusterLabelKey]; ok && v != p.clusterName {
+						continue
+					}
 				}
 				instance := &Instance{
 					InstanceID:   inst.Name,

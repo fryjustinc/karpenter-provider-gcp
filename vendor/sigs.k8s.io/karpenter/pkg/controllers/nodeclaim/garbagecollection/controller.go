@@ -96,6 +96,15 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if node != nil && nodeutils.GetCondition(node, corev1.NodeReady).Status == corev1.ConditionTrue {
 			return
 		}
+		// Double-check the provider directly to avoid false positives when List is incomplete.
+		if nodeClaims[i].Status.ProviderID != "" {
+			if _, getErr := c.cloudProvider.Get(ctx, nodeClaims[i].Status.ProviderID); getErr == nil {
+				return
+			} else if !cloudprovider.IsNodeClaimNotFoundError(getErr) {
+				errs[i] = getErr
+				return
+			}
+		}
 		if err := c.kubeClient.Delete(ctx, nodeClaims[i]); err != nil {
 			errs[i] = client.IgnoreNotFound(err)
 			return

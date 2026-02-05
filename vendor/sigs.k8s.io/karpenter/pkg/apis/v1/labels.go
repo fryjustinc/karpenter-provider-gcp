@@ -82,6 +82,7 @@ var (
 	// the range of the corresponding values by either nodepool or pods.
 	WellKnownLabels = sets.New(
 		NodePoolLabelKey,
+		"workload-type",
 		v1.LabelTopologyZone,
 		v1.LabelTopologyRegion,
 		v1.LabelInstanceTypeStable,

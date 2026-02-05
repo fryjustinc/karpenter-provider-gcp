@@ -34,10 +34,12 @@ import (
 )
 
 var (
-	maxPodsPerNodeRegex  = regexp.MustCompile(`max-pods-per-node=\d+`)
-	maxPodsRegex         = regexp.MustCompile(`max-pods=\d+`)
-	gkeProvisioningRegex = regexp.MustCompile(`gke-provisioning=\w+`)
-	nodeLabelsRegex      = regexp.MustCompile(`--node-labels=([^ ]+)`)
+	maxPodsPerNodeRegex   = regexp.MustCompile(`max-pods-per-node=\d+`)
+	maxPodsRegex          = regexp.MustCompile(`max-pods=\d+`)
+	gkeProvisioningRegex  = regexp.MustCompile(`gke-provisioning=\w+`)
+	nodeLabelsRegex       = regexp.MustCompile(`--node-labels=([^ ]+)`)
+	nodeLabelsArgRegex    = regexp.MustCompile(`(--node-labels=)("[^"]*"|[^\s]+)`)
+	autoscalerLabelsRegex = regexp.MustCompile(`(node_labels=)("[^"]*"|[^\s]+)`)
 )
 
 func GetClusterName(metadata *compute.Metadata) (string, error) {
@@ -114,6 +116,75 @@ func RemoveGKEBuiltinLabels(metadata *compute.Metadata, nodePoolName string) err
 	return nil
 }
 
+func removeNodePoolLabelsFromLine(line, key, expectedValue string) string {
+	line = replaceLabelArg(line, nodeLabelsArgRegex, key, expectedValue)
+	line = replaceLabelArg(line, autoscalerLabelsRegex, key, expectedValue)
+	return line
+}
+
+func replaceLabelArg(line string, re *regexp.Regexp, key, expectedValue string) string {
+	indices := re.FindAllStringSubmatchIndex(line, -1)
+	if len(indices) == 0 {
+		return line
+	}
+
+	var out strings.Builder
+	last := 0
+	for _, idx := range indices {
+		out.WriteString(line[last:idx[0]])
+		prefix := line[idx[2]:idx[3]]
+		value := line[idx[4]:idx[5]]
+		quote := ""
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			quote = "\""
+			value = value[1 : len(value)-1]
+		}
+		suffix := ""
+		if strings.HasSuffix(value, "\\") {
+			suffix = "\\"
+			value = strings.TrimSuffix(value, "\\")
+		}
+		cleaned := removeNodeLabelAny(value, key, expectedValue)
+		if cleaned != "" {
+			out.WriteString(prefix + quote + cleaned + suffix + quote)
+		}
+		last = idx[1]
+	}
+	out.WriteString(line[last:])
+	return out.String()
+}
+
+func removeNodeLabelAny(existing, key, expectedValue string) string {
+	cleaned := removeNodeLabelByKey(existing, key, expectedValue)
+	if expectedValue != "" && strings.Contains(cleaned, key+"=") {
+		return removeNodeLabelByKey(existing, key, "")
+	}
+	return cleaned
+}
+
+func removeNodeLabelByKey(existing, key, expectedValue string) string {
+	parts := strings.Split(existing, ",")
+	filtered := make([]string, 0, len(parts))
+	for _, pair := range parts {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			filtered = append(filtered, pair)
+			continue
+		}
+		if kv[0] == key {
+			if expectedValue == "" || kv[1] == expectedValue {
+				continue
+			}
+		}
+		filtered = append(filtered, pair)
+	}
+	return strings.Join(filtered, ",")
+}
+
 func SetMaxPodsPerNode(metadata *compute.Metadata, nodeClass *v1alpha1.GCENodeClass) error {
 	maxPods := nodeClass.GetMaxPods()
 	keys := []string{"kube-labels", "kube-env"}
@@ -164,8 +235,10 @@ func DisableBestEffortNodeReboot(metadata *compute.Metadata) error {
 		lines := strings.Split(kubeEnv, "\n")
 		found := false
 		for i, line := range lines {
-			if strings.HasPrefix(line, "ENABLE_BEST_EFFORT_NODE_REBOOT:") {
-				lines[i] = "ENABLE_BEST_EFFORT_NODE_REBOOT: \"false\""
+			trimmed := strings.TrimLeft(line, " \t")
+			if strings.HasPrefix(trimmed, "ENABLE_BEST_EFFORT_NODE_REBOOT:") {
+				prefix := line[:len(line)-len(trimmed)]
+				lines[i] = prefix + "ENABLE_BEST_EFFORT_NODE_REBOOT: \"false\""
 				found = true
 			}
 		}
@@ -191,7 +264,8 @@ func DisableNodeRegistrationChecker(metadata *compute.Metadata) error {
 		lines := strings.Split(kubeEnv, "\n")
 		found := false
 		for i, line := range lines {
-			if strings.HasPrefix(line, "ENABLE_NODE_REGISTRATION_CHECKER:") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "ENABLE_NODE_REGISTRATION_CHECKER:") {
 				lines[i] = "ENABLE_NODE_REGISTRATION_CHECKER: \"false\""
 				found = true
 			}
@@ -243,10 +317,12 @@ func DisableNodeRegistrationCheckerInUserData(metadata *compute.Metadata) error 
 			continue
 		}
 		userData := swag.StringValue(item.Value)
-		if !strings.HasPrefix(userData, "#cloud-config") {
+		trimmedUserData := strings.TrimLeft(userData, " \t\r\n")
+		if !strings.HasPrefix(trimmedUserData, "#cloud-config") {
 			return nil
 		}
-		trimmed := strings.TrimPrefix(userData, "#cloud-config\n")
+		trimmed := strings.TrimPrefix(trimmedUserData, "#cloud-config")
+		trimmed = strings.TrimPrefix(trimmed, "\n")
 		var config map[string]interface{}
 		if err := yaml.Unmarshal([]byte(trimmed), &config); err != nil {
 			return fmt.Errorf("failed to parse user-data: %w", err)
@@ -284,6 +360,63 @@ func DisableNodeRegistrationCheckerInUserData(metadata *compute.Metadata) error 
 			}
 		}
 		config["bootcmd"] = bootcmd
+
+		// Remove gke-node-reg-checker from runcmd enable list so masking it doesn't
+		// cause systemctl enable to fail and skip enabling kubelet services.
+		switch runcmd := config["runcmd"].(type) {
+		case []interface{}:
+			updatedRuncmd := make([]interface{}, 0, len(runcmd))
+			for _, cmd := range runcmd {
+				switch v := cmd.(type) {
+				case string:
+					if strings.Contains(v, "systemctl enable") && strings.Contains(v, "gke-node-reg-checker.service") {
+						parts := strings.Fields(v)
+						filtered := parts[:0]
+						for _, part := range parts {
+							if part == "gke-node-reg-checker.service" {
+								continue
+							}
+							filtered = append(filtered, part)
+						}
+						v = strings.Join(filtered, " ")
+					}
+					updatedRuncmd = append(updatedRuncmd, v)
+				case []interface{}:
+					if len(v) >= 2 && fmt.Sprint(v[0]) == "systemctl" && fmt.Sprint(v[1]) == "enable" {
+						filtered := make([]interface{}, 0, len(v))
+						for _, part := range v {
+							if fmt.Sprint(part) == "gke-node-reg-checker.service" {
+								continue
+							}
+							filtered = append(filtered, part)
+						}
+						updatedRuncmd = append(updatedRuncmd, filtered)
+					} else {
+						updatedRuncmd = append(updatedRuncmd, v)
+					}
+				default:
+					updatedRuncmd = append(updatedRuncmd, v)
+				}
+			}
+			config["runcmd"] = updatedRuncmd
+		case []string:
+			updatedRuncmd := make([]string, 0, len(runcmd))
+			for _, cmd := range runcmd {
+				if strings.Contains(cmd, "systemctl enable") && strings.Contains(cmd, "gke-node-reg-checker.service") {
+					parts := strings.Fields(cmd)
+					filtered := parts[:0]
+					for _, part := range parts {
+						if part == "gke-node-reg-checker.service" {
+							continue
+						}
+						filtered = append(filtered, part)
+					}
+					cmd = strings.Join(filtered, " ")
+				}
+				updatedRuncmd = append(updatedRuncmd, cmd)
+			}
+			config["runcmd"] = updatedRuncmd
+		}
 
 		updated, err := yaml.Marshal(config)
 		if err != nil {
