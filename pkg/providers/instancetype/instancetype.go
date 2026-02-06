@@ -121,12 +121,23 @@ func (p *DefaultProvider) validateState() error {
 }
 
 func (p *DefaultProvider) List(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) ([]*cloudprovider.InstanceType, error) {
+	// The provider's instancetype controller should populate instanceTypesInfo, but in practice other controllers may
+	// call List before that happens (especially after restarts). If we have no cached state, self-heal by forcing an
+	// update so provisioning/disruption logic doesn't get stuck with "no instance types found".
+	p.muInstanceTypesInfo.RLock()
+	needsInit := len(p.instanceTypesInfo) == 0
+	p.muInstanceTypesInfo.RUnlock()
+	if needsInit {
+		if err := p.UpdateInstanceTypes(ctx); err != nil {
+			return nil, err
+		}
+		if err := p.UpdateInstanceTypeOfferings(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	p.muInstanceTypesInfo.RLock()
 	defer p.muInstanceTypesInfo.RUnlock()
-
-	if err := p.validateState(); err != nil {
-		return nil, err
-	}
 
 	zones, err := p.gkeProvider.ResolveClusterZones(ctx)
 	if err != nil {
