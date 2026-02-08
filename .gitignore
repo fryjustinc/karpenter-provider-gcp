@@ -32,3 +32,6 @@ go.work.sum
 demo
 
 _go
+
+# Local scratch copy used during debugging; not part of the build.
+third_party/
