@@ -41,9 +41,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
+	kscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
+	resources "sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 var errCandidateDeleting = fmt.Errorf("candidate is deleting")
@@ -73,6 +75,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
+	pendingPodKeys := sets.NewString(lo.Map(pods, func(p *corev1.Pod, _ int) string {
+		return client.ObjectKeyFromObject(p).String()
+	})...)
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
@@ -139,6 +144,83 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 			}
 		}
 	}
+
+	// Debug why consolidation can't remove nodes without launching replacements.
+	// We intentionally keep the output compact and only log for the single-candidate case.
+	if len(candidates) == 1 && len(results.NewNodeClaims) > 0 {
+		candidatePodKeys := sets.NewString(lo.Map(candidates[0].reschedulablePods, func(p *corev1.Pod, _ int) string {
+			return client.ObjectKeyFromObject(p).String()
+		})...)
+		originOf := func(p *corev1.Pod) string {
+			key := client.ObjectKeyFromObject(p).String()
+			if candidatePodKeys.Has(key) {
+				return "candidate"
+			}
+			if pendingPodKeys.Has(key) {
+				return "pending"
+			}
+			if _, ok := deletingNodePodKeys[client.ObjectKeyFromObject(p)]; ok {
+				return "deleting"
+			}
+			return "other"
+		}
+
+		l := log.FromContext(ctx).WithValues(
+			"candidate", candidates[0].Name(),
+			"nodepool", candidates[0].NodePool.Name,
+			"pods", len(pods),
+			"existingNodes", len(results.ExistingNodes),
+			"newNodeClaims", len(results.NewNodeClaims),
+		)
+		for i, nc := range results.NewNodeClaims {
+			l.Debug(fmt.Sprintf("simulate scheduling produced new nodeclaim #%d", i), "pods", len(nc.Pods))
+			for _, p := range nc.Pods {
+				vols, vErr := kscheduling.GetVolumes(ctx, kubeClient, p)
+				// Pre-compute pod data similarly to the scheduler to understand why it can't go onto existing nodes.
+				reqs := kscheduling.NewPodRequirements(p)
+				if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
+					reqs = kscheduling.NewStrictPodRequirements(p)
+				}
+				strictReqs := reqs
+				if kscheduling.HasPreferredNodeAffinity(p) {
+					strictReqs = kscheduling.NewStrictPodRequirements(p)
+				}
+				podData := &scheduling.PodData{
+					Requests:           resources.RequestsForPods(p),
+					Requirements:       reqs,
+					StrictRequirements: strictReqs,
+				}
+
+				var failures []string
+				if vErr != nil {
+					failures = append(failures, fmt.Sprintf("volumes:%v", vErr))
+				} else {
+					for _, en := range results.ExistingNodes {
+						_, eErr := en.CanAdd(p, podData, vols)
+						if eErr == nil {
+							// This should be impossible if the scheduler put the pod on a new nodeclaim; log it loudly.
+							l.Error(fmt.Errorf("pod was schedulable on existing node"), "unexpected simulate scheduling behavior", "pod", klog.KObj(p), "existingNode", en.Name())
+							failures = nil
+							break
+						}
+						failures = append(failures, fmt.Sprintf("%s:%v", en.Name(), eErr))
+						if len(failures) >= 6 {
+							break
+						}
+					}
+				}
+
+				l.Debug(
+					"pod required a new nodeclaim",
+					"pod", klog.KObj(p),
+					"origin", originOf(p),
+					"nodeSelector", p.Spec.NodeSelector,
+					"failureSummary", strings.Join(failures, "; "),
+				)
+			}
+		}
+	}
+
 	return results, nil
 }
 
