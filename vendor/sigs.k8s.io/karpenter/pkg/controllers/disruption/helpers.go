@@ -173,7 +173,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 			"newNodeClaims", len(results.NewNodeClaims),
 		)
 		for i, nc := range results.NewNodeClaims {
-			l.Debug(fmt.Sprintf("simulate scheduling produced new nodeclaim #%d", i), "pods", len(nc.Pods))
+			l.V(1).Info("simulate scheduling produced new nodeclaim", "index", i, "pods", len(nc.Pods))
 			for _, p := range nc.Pods {
 				vols, vErr := kscheduling.GetVolumes(ctx, kubeClient, p)
 				// Pre-compute pod data similarly to the scheduler to understand why it can't go onto existing nodes.
@@ -210,7 +210,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 					}
 				}
 
-				l.Debug(
+				l.V(1).Info(
 					"pod required a new nodeclaim",
 					"pod", klog.KObj(p),
 					"origin", originOf(p),
